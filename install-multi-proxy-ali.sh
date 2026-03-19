@@ -1,70 +1,54 @@
 #!/bin/bash
-echo "=================================="
-echo "    多网卡共享端口代理方案 (增强版)"
-echo "    包含：策略路由自动同步"
-echo "=================================="
-echo ""
 
-# 1. 清理旧配置
-echo "🧹 清理旧配置..."
+# ====================================================
+#  多网卡共享端口代理一键安装脚本 (V2.0 稳定版)
+# ====================================================
+
+# 1. 基础环境准备
+echo "🧹 清理旧环境..."
 systemctl stop 3proxy proxy-ip-monitor 2>/dev/null
-systemctl disable 3proxy proxy-ip-monitor 2>/dev/null
 pkill -9 3proxy 2>/dev/null
 rm -rf /etc/3proxy /usr/local/3proxy /usr/bin/3proxy
 rm -f /etc/systemd/system/3proxy.service /etc/systemd/system/proxy-ip-monitor.service
-systemctl daemon-reload
 
-# 2. 识别网卡
-echo ""
-echo "🔍 识别网卡配置..."
-
+# 2. 核心网络识别
+echo "🔍 识别网络拓扑..."
 MAIN_IFACE=$(ip route show default | awk '{print $5}' | head -1)
 MAIN_IP=$(ip -4 addr show $MAIN_IFACE | grep "inet " | awk '{print $2}' | cut -d'/' -f1)
-# 获取主默认网关
 DEFAULT_GW=$(ip route show default | awk '{print $3}' | head -1)
 
-echo "主网卡（管理用）: $MAIN_IFACE"
-echo "  IP: $MAIN_IP"
-echo "  默认网关: $DEFAULT_GW"
-echo ""
-
+# 获取所有待代理的网卡
 PROXY_IFACES=($(ip -o link show | awk -F': ' '{print $2}' | grep -v "^lo$" | grep -v "^$MAIN_IFACE$"))
 
 if [ ${#PROXY_IFACES[@]} -eq 0 ]; then
-    echo "❌ 未找到代理网卡！"
+    echo "❌ 未找到副网卡，请检查网卡是否已绑定到实例！"
     exit 1
 fi
 
-# 3. 安装3proxy (保持原有逻辑)
-echo "📦 安装3proxy..."
+# 3. 安装 3proxy (0.9.4)
+echo "📦 编译安装 3proxy..."
 cd /tmp
-if [ ! -f 3proxy.tar.gz ]; then
-    wget https://github.com/3proxy/3proxy/archive/refs/tags/0.9.4.tar.gz -O 3proxy.tar.gz
-fi
-rm -rf 3proxy-0.9.4
-tar -xzf 3proxy.tar.gz
-cd 3proxy-0.9.4
-make -f Makefile.Linux
-mkdir -p /usr/local/3proxy/bin /etc/3proxy
+wget -q https://github.com/3proxy/3proxy/archive/refs/tags/0.9.4.tar.gz -O 3proxy.tar.gz
+tar -xzf 3proxy.tar.gz && cd 3proxy-0.9.4
+make -f Makefile.Linux >/dev/null 2>&1
+mkdir -p /etc/3proxy /usr/local/3proxy/bin
 cp bin/3proxy /usr/local/3proxy/bin/
 ln -sf /usr/local/3proxy/bin/3proxy /usr/bin/3proxy
 
-# 4. 创建动态配置生成脚本 (核心改进：加入策略路由)
-echo ""
-echo "⚙️  创建动态配置与路由同步脚本..."
+# 4. 创建动态更新脚本 (集成策略路由)
+echo "⚙️  配置动态同步逻辑..."
 cat > /usr/local/bin/update-proxy-config.sh << EOF
 #!/bin/bash
+# 自动生成的同步脚本
 
-# 获取基础信息
-MAIN_IFACE="$MAIN_IFACE"
-DEFAULT_GW="$DEFAULT_GW"
-PROXY_IFACES=(${PROXY_IFACES[@]})
+# 基础信息
+GW="$DEFAULT_GW"
+IFACES=(${PROXY_IFACES[@]})
 
-# 生成3proxy配置头部
+# 初始化 3proxy 配置 (去掉 daemon 模式，交给 Systemd)
 cat > /etc/3proxy/3proxy.cfg << 'EOFCONF'
-daemon
-log /var/log/3proxy.log D
-maxconn 1000
+nserver 8.8.8.8
+nserver 1.1.1.1
 nscache 65536
 timeouts 1 5 30 60 180 1800 15 60
 auth strong
@@ -72,98 +56,59 @@ users user1:CL:pass123
 allow user1
 EOFCONF
 
-echo "✅ 正在同步网络与代理配置..."
+# 内核参数：关闭反向路径过滤 (必须)
+sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null
+sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null
 
-# 计数器，用于路由表ID
 table_id=101
-
-for iface in "\${PROXY_IFACES[@]}"; do
+for iface in "\${IFACES[@]}"; do
     ip=\$(ip -4 addr show \$iface 2>/dev/null | grep "inet " | awk '{print \$2}' | cut -d'/' -f1)
-    
     if [ -n "\$ip" ]; then
-        # 1. 写入3proxy配置：显式绑定监听IP和出口IP
+        # 1. 写入 3proxy 配置 (单行模式：-i 监听, -e 出口)
         echo "socks -p8001 -i\$ip -e\$ip" >> /etc/3proxy/3proxy.cfg
         
-        # 2. 策略路由配置：解决多网卡回包问题
-        # 为每个IP建立独立路由表，强制原路返回
-        ip route replace default via \$DEFAULT_GW dev \$iface table \$table_id 2>/dev/null
+        # 2. 写入策略路由 (强制回包走原网卡)
+        ip route replace default via \$GW dev \$iface table \$table_id 2>/dev/null
         ip rule del from \$ip lookup \$table_id 2>/dev/null
         ip rule add from \$ip lookup \$table_id
         
-        echo "   - 网卡 \$iface (\$ip): 已绑定并设置路由表 \$table_id"
+        sysctl -w net.ipv4.conf.\$iface.rp_filter=0 >/dev/null
         ((table_id++))
     fi
 done
 
 ip route flush cache
-echo "✅ 网络配置已更新，正在重启 3proxy..."
 systemctl restart 3proxy
 EOF
 
 chmod +x /usr/local/bin/update-proxy-config.sh
 
-# 5. 初始化配置
-echo ""
-echo "📝 执行首次配置同步..."
-/usr/local/bin/update-proxy-config.sh
-
-# 6. 监控脚本与服务 (保持原有逻辑，但调用新的更新脚本)
-echo ""
-echo "📡 创建IP变化监控脚本..."
-# [此处保持你原来的 monitor-ip-change.sh 代码即可，它会自动调用 update-proxy-config.sh]
-cat > /usr/local/bin/monitor-ip-change.sh << 'EOF'
-#!/bin/bash
-# (此处省略重复的监控逻辑代码，保持你原始脚本中的内容)
-# ... 监控循环中调用 /usr/local/bin/update-proxy-config.sh ...
-EOF
-chmod +x /usr/local/bin/monitor-ip-change.sh
-
-# 7. 创建systemd服务
+# 5. 创建 Systemd 服务 (使用 Simple 模式，最稳定)
+echo "🔧 创建系统服务..."
 cat > /etc/systemd/system/3proxy.service << 'EOF'
 [Unit]
-Description=3proxy Multi-Interface SOCKS5 Proxy
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=forking
-ExecStart=/usr/bin/3proxy /etc/3proxy/3proxy.cfg
-Restart=on-failure
-RestartSec=5s
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-cat > /etc/systemd/system/proxy-ip-monitor.service << 'EOF'
-[Unit]
-Description=Multi-Interface IP Change Monitor
+Description=3proxy Multi-Interface Proxy
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/monitor-ip-change.sh
+ExecStart=/usr/bin/3proxy /etc/3proxy/3proxy.cfg
 Restart=always
-RestartSec=10s
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# 8. 防火墙与启动
-echo ""
-echo "🔥 放行端口并启动服务..."
-iptables -I INPUT -p tcp --dport 8001 -j ACCEPT
+# 6. 初始化运行
+echo "🚀 正在激活配置..."
+/usr/local/bin/update-proxy-config.sh
 systemctl daemon-reload
-systemctl enable 3proxy proxy-ip-monitor
-systemctl start proxy-ip-monitor
+systemctl enable 3proxy
+iptables -I INPUT -p tcp --dport 8001 -j ACCEPT 2>/dev/null
 
+echo "=================================="
+echo " ✅ 一键部署完成！"
+echo "=================================="
+echo "代理端口: 8001 (共享)"
+echo "验证方式: socks5://user1:pass123@{IP}:8001"
 echo ""
-echo "=================================="
-echo "    ✅ 安装并修复完成！"
-echo "=================================="
-echo "测试命令："
-for iface in "${PROXY_IFACES[@]}"; do
-    ip=$(ip -4 addr show $iface 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d'/' -f1)
-    [ -n "$ip" ] && echo "curl --socks5 user1:pass123@${ip}:8001 http://httpbin.org/ip"
-done
